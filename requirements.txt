@@ -3,6 +3,4 @@ flask-cors
 requests
 beautifulsoup4
 lxml
-transformers
-torch
 gunicorn
