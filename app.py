@@ -6,11 +6,30 @@ import requests as req
 import re
 import os
 import time
-import random
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
 analyzer = SentimentAnalyzer()
+
+# ---------------------------------------------------------------------------
+# Fixed realistic browser headers — consistent and reliable
+# ---------------------------------------------------------------------------
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 # ---------------------------------------------------------------------------
 # URL Helpers
@@ -19,8 +38,7 @@ analyzer = SentimentAnalyzer()
 def resolve_short_url(url: str) -> str:
     """Expand short Amazon URLs like https://amzn.in/d/xxxxx to full URLs."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = req.get(url, headers=headers, allow_redirects=True, timeout=15)
+        response = req.get(url, headers=HEADERS, allow_redirects=True, timeout=15)
         return response.url
     except Exception as e:
         print(f"URL resolve error: {e}")
@@ -28,9 +46,8 @@ def resolve_short_url(url: str) -> str:
 
 
 def is_valid_amazon_url(url: str) -> bool:
-    """Validate both full and short Amazon URLs."""
     full_pattern = r"https://(www\.)?amazon\.(in|com|co\.uk|de|fr|ca|com\.au|co\.jp)/.*"
-    short_pattern = r"https://(www\.)?amzn\.(in|com|to)/.*"
+    short_pattern = r"https?://(www\.)?amzn\.(in|com|to)/.*"
     return bool(re.match(full_pattern, url) or re.match(short_pattern, url))
 
 
@@ -40,7 +57,7 @@ def get_asin_from_url(url: str) -> str:
         r'/dp/([A-Z0-9]{10})',
         r'/product/([A-Z0-9]{10})',
         r'/gp/product/([A-Z0-9]{10})',
-        r'([A-Z0-9]{10})(?:[/?]|$)',
+        r'/product-reviews/([A-Z0-9]{10})',
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -50,40 +67,18 @@ def get_asin_from_url(url: str) -> str:
 
 
 def get_domain_from_url(url: str) -> str:
-    """Extract amazon domain from URL."""
     match = re.search(r'(amazon\.\w+(?:\.\w+)?)', url)
     return match.group(1) if match else 'amazon.in'
 
 
-def get_random_headers() -> dict:
-    """Return randomized headers to avoid bot detection."""
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    ]
-    return {
-        "User-Agent": random.choice(user_agents),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-    }
-
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
 
 def scrape_page(url: str, session: req.Session) -> BeautifulSoup:
-    """Scrape a single page and return BeautifulSoup object."""
-    time.sleep(random.uniform(1, 3))  # Random delay to avoid bot detection
-    response = session.get(url, headers=get_random_headers(), timeout=20)
+    time.sleep(1.5)  # Fixed polite delay — consistent and avoids rate limiting
+    response = session.get(url, headers=HEADERS, timeout=20)
+    print(f"Scraped {url} — status {response.status_code}")
     return BeautifulSoup(response.text, "lxml")
 
 
@@ -94,54 +89,79 @@ def scrape_amazon_reviews(url: str):
     product_rating = "No Rating"
 
     session = req.Session()
+    session.headers.update(HEADERS)
 
     try:
-        # Load product page first
+        # Step 1: Load product page for metadata
         soup = scrape_page(url, session)
 
         product_name_tag = soup.find("span", {"id": "productTitle"})
         product_name = product_name_tag.get_text(strip=True) if product_name_tag else "Unknown Product"
 
-        product_image_tag = soup.find("img", {"id": "landingImage"})
-        if not product_image_tag:
-            product_image_tag = soup.find("img", {"id": "imgBlkFront"})
+        product_image_tag = (
+            soup.find("img", {"id": "landingImage"}) or
+            soup.find("img", {"id": "imgBlkFront"}) or
+            soup.find("img", {"data-old-hires": True})
+        )
         product_image = product_image_tag.get("src") if product_image_tag else None
 
         product_rating_tag = soup.find("span", {"class": "a-icon-alt"})
         product_rating = product_rating_tag.get_text(strip=True) if product_rating_tag else "No Rating"
 
-        # Get reviews from product page
+        # Collect reviews from product page
         page_reviews = [r.get_text(strip=True) for r in soup.select("span[data-hook='review-body']")]
         all_reviews.extend(page_reviews)
-        print(f"Product page reviews: {len(page_reviews)}")
+        print(f"Product page: {len(page_reviews)} reviews")
 
-        # Try dedicated reviews page
+        # Step 2: Scrape dedicated reviews pages for more data
         asin = get_asin_from_url(url)
         domain = get_domain_from_url(url)
 
         if asin:
-            for page_num in range(1, 5):  # Scrape up to 4 pages
-                reviews_url = f"https://www.{domain}/product-reviews/{asin}?reviewerType=all_reviews&pageNumber={page_num}&sortBy=recent"
-                print(f"Scraping reviews page {page_num}: {reviews_url}")
+            for page_num in range(1, 6):  # Up to 5 pages = ~50 reviews
+                reviews_url = (
+                    f"https://www.{domain}/product-reviews/{asin}"
+                    f"?reviewerType=all_reviews&pageNumber={page_num}&sortBy=recent"
+                )
                 try:
                     soup2 = scrape_page(reviews_url, session)
-                    page_reviews = [r.get_text(strip=True) for r in soup2.select("span[data-hook='review-body']")]
-                    print(f"Page {page_num} reviews: {len(page_reviews)}")
-                    if not page_reviews:
+
+                    # Check if Amazon served a captcha/block page
+                    if soup2.find("form", {"action": "/errors/validateCaptcha"}):
+                        print(f"Amazon served captcha on page {page_num}, stopping.")
                         break
+
+                    page_reviews = [
+                        r.get_text(strip=True)
+                        for r in soup2.select("span[data-hook='review-body']")
+                    ]
+                    print(f"Reviews page {page_num}: {len(page_reviews)} reviews")
+
+                    if not page_reviews:
+                        print(f"No reviews on page {page_num}, stopping.")
+                        break
+
                     all_reviews.extend(page_reviews)
+
                 except Exception as e:
-                    print(f"Error scraping page {page_num}: {e}")
+                    print(f"Error on reviews page {page_num}: {e}")
                     break
 
-        # Deduplicate
-        all_reviews = list(dict.fromkeys([r for r in all_reviews if r.strip()]))
-        print(f"Total reviews after dedup: {len(all_reviews)}")
+        # Deduplicate while preserving order
+        seen = set()
+        unique_reviews = []
+        for r in all_reviews:
+            r_clean = r.strip()
+            if r_clean and r_clean not in seen:
+                seen.add(r_clean)
+                unique_reviews.append(r_clean)
+
+        print(f"Total unique reviews: {len(unique_reviews)}")
+        return unique_reviews, product_name, product_image, product_rating
 
     except Exception as e:
         print(f"Scraping error: {e}")
-
-    return all_reviews, product_name, product_image, product_rating
+        return [], product_name, product_image, product_rating
 
 
 # ---------------------------------------------------------------------------
@@ -157,24 +177,29 @@ def analyze():
     url = data["url"].strip()
     print(f"Received URL: {url}")
 
-    # Resolve short URLs (amzn.in, amzn.com, amzn.to)
+    # Resolve short URLs like amzn.in/d/xxxxx
     if re.search(r'amzn\.(in|com|to)', url):
-        print(f"Resolving short URL: {url}")
+        print(f"Resolving short URL...")
         url = resolve_short_url(url)
         print(f"Resolved to: {url}")
 
-    # Clean tracking parameters from URL
+    # Strip tracking query parameters for cleaner scraping
     clean_url = re.sub(r'\?.*$', '', url)
     if is_valid_amazon_url(clean_url):
         url = clean_url
+        print(f"Cleaned URL: {url}")
 
     if not is_valid_amazon_url(url):
-        return jsonify({"error": f"Invalid URL: {url}. Please provide a valid Amazon product URL."}), 422
+        return jsonify({
+            "error": f"Invalid URL. Please provide a valid Amazon product URL (amazon.in, amazon.com or amzn.in short links)."
+        }), 422
 
     reviews, product_name, product_image, product_rating = scrape_amazon_reviews(url)
 
     if not reviews:
-        return jsonify({"error": "No reviews found. Amazon may have blocked the scraping request. Please try a different product URL."}), 404
+        return jsonify({
+            "error": "No reviews found. Amazon may have blocked the request. Please try again in a few minutes or use a different product URL."
+        }), 404
 
     analyzed_reviews = analyzer.analyze_reviews(reviews)
 
