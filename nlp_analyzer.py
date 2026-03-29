@@ -1,189 +1,205 @@
 import requests
 import re
 import os
-import time
+import json
 
-# Using cardiffnlp/twitter-roberta-base-sentiment-latest
-# This model has 3 classes: positive, neutral, negative
-# Much more accurate than distilbert-sst-2 which only has 2 classes
-HF_API_URL = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+# ---------------------------------------------------------------------------
+# We use the Anthropic Claude API for accurate sentiment analysis.
+# Claude understands full sentence context, sarcasm, mixed emotions, etc.
+# Get a free API key at console.anthropic.com
+# Set it as ANTHROPIC_API_KEY in Render environment variables.
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+STRONG_POSITIVE_WORDS = [
+    "superb", "super", "excellent", "outstanding", "amazing", "fantastic",
+    "brilliant", "perfect", "awesome", "wonderful", "love it", "best",
+    "impressive", "flawless", "exceptional", "highly recommend", "great product",
+    "value for money", "worth every", "fast delivery", "works perfectly",
+    "very happy", "very satisfied", "good quality", "nice product",
+    "good product", "sturdy", "comfortable", "happy with", "loving it",
+]
+
+STRONG_NEGATIVE_WORDS = [
+    "worst", "terrible", "horrible", "pathetic", "useless", "waste",
+    "fraud", "fake", "broken", "damaged", "defective", "poor quality",
+    "do not buy", "don't buy", "not worth", "disappointed", "cheated",
+    "bad product", "bad quality", "stopped working", "not working",
+    "returned", "refund", "scam", "waste of money", "very bad",
+    "not good", "falling apart", "cheaply made",
+]
+
+POSITIVE_EMOJIS = ['🤩','🔥','❤️','😍','👍','✅','💯','🌟','⭐','😊','🥰','💪','🎉','😄','🙌']
+NEGATIVE_EMOJIS = ['😡','💔','👎','😤','🤬','❌','😞','😠','🙁','😢','💀','🤮','😒']
 
 
 class SentimentAnalyzer:
     def __init__(self):
-        self.headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-        print(f"SentimentAnalyzer initialized. HF_TOKEN set: {bool(HF_TOKEN)}")
+        if ANTHROPIC_API_KEY:
+            print("✓ Using Claude API for sentiment analysis")
+        else:
+            print("⚠ No ANTHROPIC_API_KEY found — using keyword analysis only")
 
     def _clean_review(self, text: str) -> str:
-        """Clean and prepare review text for analysis."""
-        # Remove extra whitespace
         text = re.sub(r'\s+', ' ', text).strip()
-        # Remove HTML entities
-        text = re.sub(r'&[a-zA-Z]+;', ' ', text)
-        # Truncate to model limit (512 tokens ~ 400 words)
-        words = text.split()
-        if len(words) > 400:
-            text = ' '.join(words[:400])
-        return text
+        return text[:600]
 
-    def _query_hf_api(self, text: str, retries: int = 3) -> list:
-        """Query HuggingFace API with retry logic."""
-        for attempt in range(retries):
-            try:
-                response = requests.post(
-                    HF_API_URL,
-                    headers=self.headers,
-                    json={"inputs": text},
-                    timeout=30,
-                )
-                result = response.json()
+    def _emoji_sentiment(self, text: str):
+        pos = sum(1 for e in POSITIVE_EMOJIS if e in text)
+        neg = sum(1 for e in NEGATIVE_EMOJIS if e in text)
+        if pos > neg and pos > 0:
+            return 'positive', 0.90
+        elif neg > pos and neg > 0:
+            return 'negative', 0.90
+        return None
 
-                # Handle model loading (first request may need to wait)
-                if isinstance(result, dict) and "error" in result:
-                    error_msg = result["error"]
-                    if "loading" in error_msg.lower():
-                        print(f"Model loading, waiting 10s... (attempt {attempt+1})")
-                        time.sleep(10)
-                        continue
-                    else:
-                        print(f"HF API error: {error_msg}")
-                        return []
+    def _keyword_sentiment(self, text: str):
+        t = text.lower()
+        pos = sum(1 for w in STRONG_POSITIVE_WORDS if w in t)
+        neg = sum(1 for w in STRONG_NEGATIVE_WORDS if w in t)
+        if pos > 0 and neg == 0:
+            return 'positive', min(0.75 + pos * 0.05, 0.95)
+        elif neg > 0 and pos == 0:
+            return 'negative', min(0.75 + neg * 0.05, 0.95)
+        elif pos > neg:
+            return 'positive', 0.70
+        elif neg > pos:
+            return 'negative', 0.70
+        return None
 
-                # Result is [[{label, score}, {label, score}, {label, score}]]
-                if isinstance(result, list) and len(result) > 0:
-                    scores = result[0] if isinstance(result[0], list) else result
-                    return scores
-
-            except Exception as e:
-                print(f"HF API attempt {attempt+1} failed: {e}")
-                if attempt < retries - 1:
-                    time.sleep(2)
-
-        return []
-
-    def _get_sentiment_from_scores(self, scores: list) -> tuple:
+    def _claude_sentiment_batch(self, reviews: list) -> list:
         """
-        Extract sentiment and confidence from API scores.
-        Returns (sentiment, confidence).
-        Model labels: positive, neutral, negative
+        Use Claude to analyze up to 20 reviews at once for efficiency.
+        Claude understands full sentence context, sarcasm, and mixed emotions.
         """
-        if not scores:
-            return "neutral", 0.5
+        if not ANTHROPIC_API_KEY:
+            return None
 
-        # Build a label->score map
-        label_map = {}
-        for item in scores:
-            label = item.get("label", "").lower()
-            score = item.get("score", 0.0)
-            # Normalize label variations
-            if label in ["positive", "pos", "label_2"]:
-                label_map["positive"] = score
-            elif label in ["negative", "neg", "label_0"]:
-                label_map["negative"] = score
-            elif label in ["neutral", "neu", "label_1"]:
-                label_map["neutral"] = score
+        numbered = "\n".join([f"{i+1}. {r[:300]}" for i, r in enumerate(reviews)])
 
-        if not label_map:
-            return "neutral", 0.5
+        prompt = f"""You are a sentiment analysis expert for Amazon product reviews.
 
-        # Get the highest scoring label
-        best_label = max(label_map, key=label_map.get)
-        best_score = label_map[best_label]
+Analyze each review below and classify it as exactly one of: positive, neutral, or negative.
 
-        pos = label_map.get("positive", 0)
-        neg = label_map.get("negative", 0)
-        neu = label_map.get("neutral", 0)
+Rules:
+- "positive": Overall happy, satisfied, recommends the product, praises quality/value
+- "negative": Unhappy, disappointed, complains about quality/delivery/damage, warns others
+- "neutral": Mixed feelings, neither clearly happy nor unhappy, just stating facts
+- Consider the FULL sentence meaning, not just individual words
+- "good but broken headrest" = NEGATIVE (problem outweighs positive)
+- "value for money" = POSITIVE
+- "comfortable and easy to assemble" = POSITIVE
+- "good product" = POSITIVE
+- "sturdy and comfortable" = POSITIVE
+- "overall happy" = POSITIVE
 
-        print(f"  Scores -> pos:{pos:.2f} neu:{neu:.2f} neg:{neg:.2f} => {best_label} ({best_score:.2f})")
+Return ONLY a valid JSON array with {len(reviews)} objects, one per review, in order:
+[{{"sentiment": "positive", "confidence": 0.92}}, ...]
 
-        return best_label, round(best_score, 2)
+confidence should be between 0.70 and 0.99.
 
-    def _check_strong_words(self, text: str) -> str | None:
-        """
-        Detect clearly positive/negative phrases that the model might miss.
-        Returns override sentiment or None.
-        """
-        text_lower = text.lower()
+Reviews to analyze:
+{numbered}"""
 
-        # Strong positive signals
-        strong_positive = [
-            "excellent", "outstanding", "superb", "fantastic", "amazing",
-            "absolutely love", "perfect product", "best purchase", "highly recommend",
-            "5 star", "five star", "worth every", "exceeded expectations",
-            "mind blowing", "blown away", "totally worth", "very happy",
-            "great quality", "super product", "awesome", "brilliant",
-        ]
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
 
-        # Strong negative signals
-        strong_negative = [
-            "waste of money", "worst product", "terrible", "horrible",
-            "do not buy", "don't buy", "pathetic", "useless", "garbage",
-            "very disappointed", "extremely disappointed", "scam",
-            "broken", "stopped working", "complete waste", "fraud",
-            "return immediately", "not worth", "poor quality",
-        ]
+            data = response.json()
+            if "content" not in data:
+                print(f"Claude API error: {data}")
+                return None
 
-        # Emojis
-        positive_emojis = ['🤩', '🔥', '❤️', '😍', '👍', '✅', '💯', '🌟', '⭐', '😊', '🥰']
-        negative_emojis = ['😡', '💔', '👎', '😤', '🤬', '❌', '😞', '😠', '🤦', '😒']
+            raw = data["content"][0]["text"].strip()
+            # Extract JSON array even if there's extra text
+            match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if not match:
+                print(f"Could not find JSON in response: {raw[:200]}")
+                return None
 
-        for phrase in strong_negative:
-            if phrase in text_lower:
-                print(f"  Strong negative phrase detected: '{phrase}'")
-                return "negative"
+            results = json.loads(match.group())
+            if len(results) == len(reviews):
+                return results
+            print(f"Result count mismatch: expected {len(reviews)}, got {len(results)}")
+            return None
 
-        for phrase in strong_positive:
-            if phrase in text_lower:
-                print(f"  Strong positive phrase detected: '{phrase}'")
-                return "positive"
-
-        for emoji in negative_emojis:
-            if emoji in text:
-                return "negative"
-
-        for emoji in positive_emojis:
-            if emoji in text:
-                return "positive"
-
-        return None  # No override
+        except Exception as e:
+            print(f"Claude API error: {e}")
+            return None
 
     def analyze_reviews(self, reviews: list) -> list:
         results = []
-        total = len(reviews)
+        # Separate reviews that need AI vs those handled by rules
+        ai_needed_indices = []
+        ai_needed_reviews = []
+        pre_results = {}
 
         for i, review in enumerate(reviews):
-            print(f"Analyzing review {i+1}/{total}...")
-            try:
-                cleaned = self._clean_review(review)
+            cleaned = self._clean_review(review)
 
-                # Query HuggingFace API
-                scores = self._query_hf_api(cleaned)
-                sentiment, confidence = self._get_sentiment_from_scores(scores)
+            # Priority 1: Emoji (most explicit signal)
+            emoji = self._emoji_sentiment(review)
+            if emoji:
+                pre_results[i] = {"text": review, "sentiment": emoji[0], "confidence": round(emoji[1], 2)}
+                continue
 
-                # Check for strong keyword/emoji overrides
-                # Only override if model confidence is below 0.75
-                if confidence < 0.75:
-                    override = self._check_strong_words(review)
-                    if override:
-                        print(f"  Override: {sentiment} -> {override}")
-                        sentiment = override
-                        confidence = max(confidence, 0.80)
+            # Priority 2: Strong keywords
+            keyword = self._keyword_sentiment(cleaned)
+            if keyword:
+                pre_results[i] = {"text": review, "sentiment": keyword[0], "confidence": round(keyword[1], 2)}
+                continue
 
+            # Needs Claude analysis
+            ai_needed_indices.append(i)
+            ai_needed_reviews.append(cleaned)
+
+        # Batch Claude analysis in groups of 20
+        ai_results_map = {}
+        if ai_needed_reviews and ANTHROPIC_API_KEY:
+            batch_size = 20
+            flat_results = []
+            for b in range(0, len(ai_needed_reviews), batch_size):
+                batch = ai_needed_reviews[b:b+batch_size]
+                batch_results = self._claude_sentiment_batch(batch)
+                if batch_results:
+                    flat_results.extend(batch_results)
+                else:
+                    # Fallback: mark as neutral
+                    flat_results.extend([{"sentiment": "neutral", "confidence": 0.5}] * len(batch))
+
+            for idx, result in zip(ai_needed_indices, flat_results):
+                ai_results_map[idx] = result
+
+        # Assemble final results in original order
+        for i, review in enumerate(reviews):
+            if i in pre_results:
+                results.append(pre_results[i])
+            elif i in ai_results_map:
+                r = ai_results_map[i]
                 results.append({
                     "text": review,
-                    "sentiment": sentiment,
-                    "confidence": confidence,
+                    "sentiment": r.get("sentiment", "neutral"),
+                    "confidence": round(float(r.get("confidence", 0.75)), 2),
                 })
-
-            except Exception as e:
-                print(f"Analysis error on review {i+1}: {e}")
-                # Fallback: use keyword check
-                override = self._check_strong_words(review)
-                results.append({
-                    "text": review,
-                    "sentiment": override if override else "neutral",
-                    "confidence": 0.60,
-                })
+            else:
+                # Pure fallback if no AI key
+                keyword = self._keyword_sentiment(self._clean_review(review))
+                if keyword:
+                    results.append({"text": review, "sentiment": keyword[0], "confidence": round(keyword[1], 2)})
+                else:
+                    results.append({"text": review, "sentiment": "neutral", "confidence": 0.5})
 
         return results
