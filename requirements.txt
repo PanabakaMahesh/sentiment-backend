@@ -4,4 +4,4 @@ requests
 beautifulsoup4
 lxml
 transformers
-torch==2.1.0
+torch
