@@ -11,34 +11,46 @@ app = Flask(__name__)
 CORS(app, origins=["*"])
 analyzer = SentimentAnalyzer()
 
-# Consistent headers that closely mimic a real Chrome browser on Windows
+# ---------------------------------------------------------------------------
+# ScraperAPI config — free tier: 1000 credits/month
+# Sign up at scraperapi.com and paste your key here OR set as env variable
+# ---------------------------------------------------------------------------
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
+
 AMAZON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
 }
+
+
+def build_scraper_url(target_url: str) -> str:
+    """Wrap target URL with ScraperAPI if key is available."""
+    if SCRAPER_API_KEY:
+        return f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={req.utils.quote(target_url)}&render=false&country_code=in"
+    return target_url
+
+
+def fetch_page(url: str, session: req.Session) -> BeautifulSoup:
+    """Fetch a page via ScraperAPI or directly."""
+    fetch_url = build_scraper_url(url)
+    response = session.get(fetch_url, headers=AMAZON_HEADERS, timeout=60)
+    print(f"  Status: {response.status_code} | Length: {len(response.text)}")
+    return BeautifulSoup(response.text, "lxml")
+
 
 # ---------------------------------------------------------------------------
 # URL Helpers
 # ---------------------------------------------------------------------------
 
 def resolve_short_url(url: str) -> str:
-    """Expand short Amazon URLs like https://amzn.in/d/xxxxx to full URLs."""
     try:
         session = req.Session()
-        session.headers.update(AMAZON_HEADERS)
-        response = session.get(url, allow_redirects=True, timeout=15)
-        resolved = response.url
-        print(f"Resolved {url} -> {resolved}")
-        return resolved
+        response = session.get(url, headers=AMAZON_HEADERS, allow_redirects=True, timeout=15)
+        return response.url
     except Exception as e:
         print(f"URL resolve error: {e}")
         return url
@@ -80,60 +92,57 @@ def scrape_amazon_reviews(url: str):
     product_rating = "No Rating"
 
     session = req.Session()
-    session.headers.update(AMAZON_HEADERS)
 
     try:
-        # Step 1: Load product page
-        print(f"Scraping product page: {url}")
-        response = session.get(url, timeout=20)
-        soup = BeautifulSoup(response.text, "lxml")
+        print(f"Fetching product page: {url}")
+        soup = fetch_page(url, session)
 
-        # Extract product info
+        # Extract product details
         product_name_tag = soup.find("span", {"id": "productTitle"})
         product_name = product_name_tag.get_text(strip=True) if product_name_tag else "Unknown Product"
 
-        product_image_tag = soup.find("img", {"id": "landingImage"}) or \
-                            soup.find("img", {"id": "imgBlkFront"})
+        product_image_tag = (
+            soup.find("img", {"id": "landingImage"}) or
+            soup.find("img", {"id": "imgBlkFront"})
+        )
         product_image = product_image_tag.get("src") if product_image_tag else None
 
         product_rating_tag = soup.find("span", {"class": "a-icon-alt"})
         product_rating = product_rating_tag.get_text(strip=True) if product_rating_tag else "No Rating"
 
-        # Get reviews from product page
+        # Reviews from product page
         product_page_reviews = [r.get_text(strip=True) for r in soup.select("span[data-hook='review-body']")]
         all_reviews.extend(product_page_reviews)
-        print(f"Product page: {len(product_page_reviews)} reviews")
+        print(f"Product page reviews: {len(product_page_reviews)}")
 
-        # Step 2: Scrape dedicated reviews pages for more data
+        # Dedicated reviews pages
         asin = get_asin_from_url(url)
         domain = get_domain_from_url(url)
 
         if asin:
-            print(f"ASIN: {asin}, Domain: {domain}")
-            for page_num in range(1, 6):  # Up to 5 pages = ~50 reviews
+            print(f"ASIN: {asin} | Domain: {domain}")
+            for page_num in range(1, 6):
                 reviews_url = (
                     f"https://www.{domain}/product-reviews/{asin}"
                     f"?reviewerType=all_reviews&pageNumber={page_num}&sortBy=recent"
                 )
-                print(f"Scraping reviews page {page_num}...")
-                time.sleep(1)  # Fixed 1 second delay — polite and consistent
+                print(f"Fetching reviews page {page_num}...")
+                time.sleep(1)
                 try:
-                    r2 = session.get(reviews_url, timeout=20)
-                    soup2 = BeautifulSoup(r2.text, "lxml")
+                    soup2 = fetch_page(reviews_url, session)
                     page_reviews = [
                         r.get_text(strip=True)
                         for r in soup2.select("span[data-hook='review-body']")
                     ]
                     print(f"  Page {page_num}: {len(page_reviews)} reviews")
                     if not page_reviews:
-                        print(f"  No more reviews found, stopping.")
                         break
                     all_reviews.extend(page_reviews)
                 except Exception as e:
-                    print(f"  Error on page {page_num}: {e}")
+                    print(f"  Page {page_num} error: {e}")
                     break
 
-        # Deduplicate while preserving order
+        # Deduplicate
         seen = set()
         unique_reviews = []
         for r in all_reviews:
@@ -163,26 +172,26 @@ def analyze():
     url = data["url"].strip()
     print(f"\n=== New request: {url} ===")
 
-    # Resolve short URLs first
+    # Resolve short URLs
     if re.search(r'amzn\.(in|com|to)', url):
         url = resolve_short_url(url)
+        print(f"Resolved to: {url}")
 
-    # Clean tracking parameters
+    # Strip tracking params
     clean_url = re.sub(r'\?.*$', '', url)
     if is_valid_amazon_url(clean_url):
         url = clean_url
-        print(f"Cleaned URL: {url}")
 
     if not is_valid_amazon_url(url):
         return jsonify({
-            "error": f"Invalid Amazon URL. Received: {url[:100]}. Please use amazon.in, amazon.com, or amzn.in short links."
+            "error": f"Invalid Amazon URL. Please use amazon.in, amazon.com, or amzn.in short links."
         }), 422
 
     reviews, product_name, product_image, product_rating = scrape_amazon_reviews(url)
 
     if not reviews:
         return jsonify({
-            "error": "No reviews found. Amazon may have blocked the request. Please try again in a few minutes."
+            "error": "No reviews found. Amazon blocked the scraping request. Please try again in a few minutes or try a different product."
         }), 404
 
     analyzed_reviews = analyzer.analyze_reviews(reviews)
