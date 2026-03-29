@@ -5,6 +5,8 @@ from nlp_analyzer import SentimentAnalyzer
 import requests as req
 import re
 import os
+import time
+import random
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
@@ -17,9 +19,11 @@ analyzer = SentimentAnalyzer()
 def resolve_short_url(url: str) -> str:
     """Expand short Amazon URLs like https://amzn.in/d/xxxxx to full URLs."""
     try:
-        response = req.head(url, allow_redirects=True, timeout=10)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        response = req.get(url, headers=headers, allow_redirects=True, timeout=15)
         return response.url
-    except Exception:
+    except Exception as e:
+        print(f"URL resolve error: {e}")
         return url
 
 
@@ -30,50 +34,77 @@ def is_valid_amazon_url(url: str) -> bool:
     return bool(re.match(full_pattern, url) or re.match(short_pattern, url))
 
 
-def get_reviews_page_url(url: str) -> str:
-    """Try to get the dedicated reviews page for more reviews."""
-    try:
-        # Extract ASIN from URL
-        asin_match = re.search(r'/dp/([A-Z0-9]{10})', url)
-        if asin_match:
-            asin = asin_match.group(1)
-            # Extract domain
-            domain_match = re.search(r'amazon\.(\w+(?:\.\w+)?)', url)
-            domain = domain_match.group(0) if domain_match else 'amazon.in'
-            return f"https://www.{domain}/product-reviews/{asin}?reviewerType=all_reviews&pageNumber=1"
-    except Exception:
-        pass
-    return url
+def get_asin_from_url(url: str) -> str:
+    """Extract ASIN from Amazon URL."""
+    patterns = [
+        r'/dp/([A-Z0-9]{10})',
+        r'/product/([A-Z0-9]{10})',
+        r'/gp/product/([A-Z0-9]{10})',
+        r'([A-Z0-9]{10})(?:[/?]|$)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Scraper
-# ---------------------------------------------------------------------------
+def get_domain_from_url(url: str) -> str:
+    """Extract amazon domain from URL."""
+    match = re.search(r'(amazon\.\w+(?:\.\w+)?)', url)
+    return match.group(1) if match else 'amazon.in'
 
-def scrape_amazon_reviews(url: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+
+def get_random_headers() -> dict:
+    """Return randomized headers to avoid bot detection."""
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+    return {
+        "User-Agent": random.choice(user_agents),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
     }
 
+
+def scrape_page(url: str, session: req.Session) -> BeautifulSoup:
+    """Scrape a single page and return BeautifulSoup object."""
+    time.sleep(random.uniform(1, 3))  # Random delay to avoid bot detection
+    response = session.get(url, headers=get_random_headers(), timeout=20)
+    return BeautifulSoup(response.text, "lxml")
+
+
+def scrape_amazon_reviews(url: str):
     all_reviews = []
     product_name = "Unknown Product"
     product_image = None
     product_rating = "No Rating"
 
+    session = req.Session()
+
     try:
-        # First load product page to get name, image, rating
-        response = req.get(url, headers=headers, timeout=15)
-        soup = BeautifulSoup(response.text, "lxml")
+        # Load product page first
+        soup = scrape_page(url, session)
 
         product_name_tag = soup.find("span", {"id": "productTitle"})
         product_name = product_name_tag.get_text(strip=True) if product_name_tag else "Unknown Product"
 
         product_image_tag = soup.find("img", {"id": "landingImage"})
+        if not product_image_tag:
+            product_image_tag = soup.find("img", {"id": "imgBlkFront"})
         product_image = product_image_tag.get("src") if product_image_tag else None
 
         product_rating_tag = soup.find("span", {"class": "a-icon-alt"})
@@ -82,21 +113,30 @@ def scrape_amazon_reviews(url: str):
         # Get reviews from product page
         page_reviews = [r.get_text(strip=True) for r in soup.select("span[data-hook='review-body']")]
         all_reviews.extend(page_reviews)
+        print(f"Product page reviews: {len(page_reviews)}")
 
-        # Also scrape dedicated reviews page for more reviews
-        reviews_url = get_reviews_page_url(url)
-        if reviews_url != url:
-            for page_num in range(1, 4):  # Scrape up to 3 pages of reviews
-                paged_url = reviews_url.replace("pageNumber=1", f"pageNumber={page_num}")
-                r2 = req.get(paged_url, headers=headers, timeout=15)
-                soup2 = BeautifulSoup(r2.text, "lxml")
-                page_reviews = [r.get_text(strip=True) for r in soup2.select("span[data-hook='review-body']")]
-                if not page_reviews:
+        # Try dedicated reviews page
+        asin = get_asin_from_url(url)
+        domain = get_domain_from_url(url)
+
+        if asin:
+            for page_num in range(1, 5):  # Scrape up to 4 pages
+                reviews_url = f"https://www.{domain}/product-reviews/{asin}?reviewerType=all_reviews&pageNumber={page_num}&sortBy=recent"
+                print(f"Scraping reviews page {page_num}: {reviews_url}")
+                try:
+                    soup2 = scrape_page(reviews_url, session)
+                    page_reviews = [r.get_text(strip=True) for r in soup2.select("span[data-hook='review-body']")]
+                    print(f"Page {page_num} reviews: {len(page_reviews)}")
+                    if not page_reviews:
+                        break
+                    all_reviews.extend(page_reviews)
+                except Exception as e:
+                    print(f"Error scraping page {page_num}: {e}")
                     break
-                all_reviews.extend(page_reviews)
 
-        # Deduplicate reviews
-        all_reviews = list(dict.fromkeys(all_reviews))
+        # Deduplicate
+        all_reviews = list(dict.fromkeys([r for r in all_reviews if r.strip()]))
+        print(f"Total reviews after dedup: {len(all_reviews)}")
 
     except Exception as e:
         print(f"Scraping error: {e}")
@@ -115,24 +155,26 @@ def analyze():
         return jsonify({"error": "Missing 'url' field in request body."}), 400
 
     url = data["url"].strip()
+    print(f"Received URL: {url}")
 
-    # Resolve short URLs like amzn.in/d/xxxxx
-    if "amzn.in" in url or "amzn.com" in url or "amzn.to" in url:
+    # Resolve short URLs (amzn.in, amzn.com, amzn.to)
+    if re.search(r'amzn\.(in|com|to)', url):
+        print(f"Resolving short URL: {url}")
         url = resolve_short_url(url)
-        print(f"Resolved short URL to: {url}")
+        print(f"Resolved to: {url}")
 
-    # Clean URL — remove query parameters that may cause issues
-    url_clean = re.sub(r'\?.*$', '', url)
-    if is_valid_amazon_url(url_clean):
-        url = url_clean
+    # Clean tracking parameters from URL
+    clean_url = re.sub(r'\?.*$', '', url)
+    if is_valid_amazon_url(clean_url):
+        url = clean_url
 
     if not is_valid_amazon_url(url):
-        return jsonify({"error": "Invalid URL. Please provide a valid Amazon product URL (amazon.in, amazon.com, or amzn.in short links)."}), 422
+        return jsonify({"error": f"Invalid URL: {url}. Please provide a valid Amazon product URL."}), 422
 
     reviews, product_name, product_image, product_rating = scrape_amazon_reviews(url)
 
     if not reviews:
-        return jsonify({"error": "No reviews found. Amazon may have blocked the request or this product has no reviews yet."}), 404
+        return jsonify({"error": "No reviews found. Amazon may have blocked the scraping request. Please try a different product URL."}), 404
 
     analyzed_reviews = analyzer.analyze_reviews(reviews)
 
